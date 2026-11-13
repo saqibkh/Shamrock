@@ -55,14 +55,14 @@ jobs:
       # The env script builds AdaptiveCpp with default options, which ROCm's
       # LLVM does not pass: it reports version 20.0.0 (a development version
       # to AdaptiveCpp) and has no libLLVM.so for the generic SSCP compiler.
-      # So AdaptiveCpp (the version the env script pins) is built here with
-      # the minimal compiler profile, which keeps the hip target, and
-      # installed where the env script looks for it.
+      # AdaptiveCpp v25.02.0 (the env script's pin) also uses warpSize as a
+      # constant, which it is not in HIP 7. So v25.10.0 (used by the leonardo
+      # and meluxina envs) is built here with the minimal compiler profile,
+      # which keeps the hip target, and installed where the env script looks.
       - name: Build AdaptiveCpp against ROCm LLVM
         run: |
           start=$(date +%s)
-          ver=$(sed -n 's/^export ACPP_VERSION=//p' env/machine/debian-generic/acpp/env_built_acpp.sh)
-          git clone --depth 1 -b "$ver" https://github.com/AdaptiveCpp/AdaptiveCpp.git build/.env/acpp-git
+          git clone --depth 1 -b v25.10.0 https://github.com/AdaptiveCpp/AdaptiveCpp.git build/.env/acpp-git
           cmake -S build/.env/acpp-git -B build/.env/acpp-builddir -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PWD/build/.env/acpp-installdir" \
