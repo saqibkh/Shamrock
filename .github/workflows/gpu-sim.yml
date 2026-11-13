@@ -48,9 +48,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             comgr hsa-rocr rocm-llvm-dev \
             libboost-context-dev libboost-fiber-dev \
-            libopenmpi-dev openmpi-bin python3-dev ninja-build
+            libopenmpi-dev openmpi-bin python3-dev ninja-build ccache
           df -h / /mnt
           ls /opt/rocm/lib/llvm/lib/cmake
+
+      - uses: hendrikmuhs/ccache-action@dbeefd73e8e2ffc1bbc412570072735eb4db3607 # v1.2.25
+        with:
+          key: gpu-sim-hip-gfx942
+          max-size: 2G
+
+      # acpp and its clang are reinstalled in each job, so key the cache on
+      # their version output (as configure_ccache does) rather than mtimes.
+      - run: ccache -o compiler_check='%compiler% -dumpmachine; %compiler% -dumpversion'
 
       # The env script builds AdaptiveCpp with default options, which ROCm's
       # LLVM does not pass: it reports version 20.0.0 (a development version
@@ -64,7 +73,7 @@ jobs:
           start=$(date +%s)
           git clone --depth 1 -b v25.10.0 https://github.com/AdaptiveCpp/AdaptiveCpp.git build/.env/acpp-git
           cmake -S build/.env/acpp-git -B build/.env/acpp-builddir -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_INSTALL_PREFIX="$PWD/build/.env/acpp-installdir" \
             -DLLVM_DIR=/opt/rocm/lib/llvm/lib/cmake/llvm \
             -DACPP_EXPERIMENTAL_LLVM=ON \
@@ -78,13 +87,16 @@ jobs:
 
       - name: Set up the environment
         env:
-          SHAMROCK_BUILD_NPROC: 3
+          SHAMROCK_BUILD_NPROC: 4
         run: ./env/new-env --machine debian-generic.acpp --builddir build -- --backend hip --arch gfx942
 
+      # ROCm 7's clang marks __AMDGCN_WAVEFRONT_SIZE deprecated, and
+      # -pedantic-errors turns its use in base_select.hpp into an error.
       - name: Configure
         run: |
           cd build
           source ./activate
+          export SHAMROCK_CXX_FLAGS="${SHAMROCK_CXX_FLAGS} -Wno-deprecated-pragma"
           shamconfigure
 
       - name: Build
@@ -95,7 +107,9 @@ jobs:
           export NINJA_STATUS="[%f/%t %es] "
           shammake shamrock shamrock_test
           echo "Shamrock build took $(( $(date +%s) - start )) s"
+          ccache -s
           df -h /
+          free -g
 
       - name: List devices
         run: |
