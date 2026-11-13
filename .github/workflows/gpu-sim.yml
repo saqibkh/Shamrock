@@ -120,6 +120,9 @@ jobs:
           echo "GPU device id: ${id}"
           echo "SYCLCFG=${id}:${id}" >> "$GITHUB_ENV"
 
+      - name: Pull reference files
+        run: git clone --depth 1 https://github.com/Shamrock-code/reference-files.git build/reference-files
+
       - name: Unit tests (one MPI rank)
         run: |
           cd build
@@ -128,3 +131,16 @@ jobs:
           mpirun --allow-run-as-root --bind-to none --oversubscribe -n 1 \
             ./shamrock_test --smi-full --sycl-cfg "${SYCLCFG}" --unittest --loglevel 0
           echo "Unit tests took $(( $(date +%s) - start )) s"
+
+      # Fork-only check that a wrong device result is caught.
+      - name: Break-the-test check
+        run: |
+          sed -i 's/idx\[i\] = i;/idx[i] = i + (i == 7);/' src/shamalgs/src/primitives/gen_buffer_index.cpp
+          git diff --stat
+          cd build
+          source ./activate
+          shammake shamrock_test
+          if ./shamrock_test --sycl-cfg "${SYCLCFG}" --unittest --loglevel 0 --run-only "shamalgs/primitives/gen_buffer_index"; then
+            echo "mutated kernel was not caught"; exit 1
+          fi
+          echo "mutated kernel caught"
