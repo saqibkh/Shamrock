@@ -1,0 +1,126 @@
+name: GPU simulator (HIP)
+
+# env_tests.yml builds the AdaptiveCpp HIP backend but cannot run it, since
+# the hosted runners have no GPU. This workflow builds Shamrock for the HIP
+# backend (gfx942) and runs the single-rank unit tests on a simulated AMD
+# Instinct MI300X (https://github.com/pantheongpu/pantheonsim). A simulator
+# does not reproduce hardware timing, so this complements runs on real GPUs.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "env/machine/debian-generic/**"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  hip:
+    name: AdaptiveCpp HIP gfx942 on a simulated MI300X
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Checkout the external submodules
+        run: git submodule update --init --recursive --depth 1 -- external
+
+      - name: Set up the simulated GPU and ROCm
+        uses: pantheongpu/pantheonsim@6e1ad92d1a1aa0b73776cb9719145f5a7d5bb33a
+        with:
+          gpu: amd/mi300x
+          cuda-toolkit: none
+          rocm: "7.1"
+
+      # AdaptiveCpp is built against ROCm's own LLVM (rocm-llvm-dev), so the
+      # device code is compiled by the clang that matches ROCm's device
+      # libraries. find_package(hip) needs the comgr and HSA CMake configs.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            comgr hsa-rocr rocm-llvm-dev \
+            libboost-context-dev libboost-fiber-dev \
+            libopenmpi-dev openmpi-bin python3-dev ninja-build ccache
+
+      - uses: hendrikmuhs/ccache-action@dbeefd73e8e2ffc1bbc412570072735eb4db3607 # v1.2.25
+        with:
+          key: gpu-sim-hip-gfx942
+          max-size: 2G
+
+      # acpp and its clang are reinstalled in each job, so key the cache on
+      # their version output (as configure_ccache does) rather than mtimes.
+      - run: ccache -o compiler_check='%compiler% -dumpmachine; %compiler% -dumpversion'
+
+      # The env script builds AdaptiveCpp with default options, which ROCm's
+      # LLVM does not pass: it reports version 20.0.0 (a development version
+      # to AdaptiveCpp) and has no libLLVM.so for the generic SSCP compiler.
+      # AdaptiveCpp v25.02.0 (the env script's pin) also uses warpSize as a
+      # constant, which it is not in HIP 7. So v25.10.0 (used by the leonardo
+      # and meluxina envs) is built here with the minimal compiler profile,
+      # which keeps the hip target, and installed where the env script looks.
+      - name: Build AdaptiveCpp against ROCm LLVM
+        run: |
+          git clone --depth 1 -b v25.10.0 https://github.com/AdaptiveCpp/AdaptiveCpp.git build/.env/acpp-git
+          cmake -S build/.env/acpp-git -B build/.env/acpp-builddir -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_INSTALL_PREFIX="$PWD/build/.env/acpp-installdir" \
+            -DLLVM_DIR=/opt/rocm/lib/llvm/lib/cmake/llvm \
+            -DACPP_EXPERIMENTAL_LLVM=ON \
+            -DACPP_COMPILER_FEATURE_PROFILE=minimal \
+            -DWITH_ROCM_BACKEND=ON -DWITH_CUDA_BACKEND=OFF \
+            -DWITH_OPENCL_BACKEND=OFF -DWITH_LEVEL_ZERO_BACKEND=OFF
+          cmake --build build/.env/acpp-builddir -j 4
+          cmake --install build/.env/acpp-builddir
+
+      - name: Set up the environment
+        env:
+          SHAMROCK_BUILD_NPROC: 4
+        run: ./env/new-env --machine debian-generic.acpp --builddir build -- --backend hip --arch gfx942
+
+      # ROCm 7's clang marks __AMDGCN_WAVEFRONT_SIZE deprecated, and
+      # -pedantic-errors turns its use in base_select.hpp into an error.
+      - name: Configure
+        run: |
+          cd build
+          source ./activate
+          export SHAMROCK_CXX_FLAGS="${SHAMROCK_CXX_FLAGS} -Wno-deprecated-pragma"
+          shamconfigure
+
+      - name: Build
+        run: |
+          cd build
+          source ./activate
+          shammake shamrock shamrock_test
+          ccache -s
+
+      - name: Select the simulated GPU
+        run: |
+          cd build
+          source ./activate
+          ./shamrock --smi | tee smi.txt
+          id=$(grep -E '^\| *[0-9]+ *\|.*GPU' smi.txt | head -1 | awk -F'|' '{gsub(/ /,"",$2); print $2}')
+          [[ -n "${id}" ]] || { echo "no GPU device listed"; exit 1; }
+          echo "SYCLCFG=${id}:${id}" >> "$GITHUB_ENV"
+
+      - name: Pull reference files
+        run: git clone --depth 1 https://github.com/Shamrock-code/reference-files.git build/reference-files
+
+      # One rank only: the multi-rank runs of test_sequence.sh are left out.
+      - name: Unit tests (one MPI rank)
+        run: |
+          cd build
+          source ./activate
+          mpirun --allow-run-as-root --bind-to none --oversubscribe -n 1 \
+            ./shamrock_test --smi-full --sycl-cfg "${SYCLCFG}" --unittest --loglevel 0
