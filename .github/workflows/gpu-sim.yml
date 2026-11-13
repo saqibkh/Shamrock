@@ -10,6 +10,13 @@ on:
   workflow_dispatch:
   push:
     branches: [verify-gpu-sim]
+  pull_request:
+    paths:
+      - "src/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "env/machine/debian-generic/**"
+      - ".github/workflows/gpu-sim.yml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -22,7 +29,7 @@ jobs:
   hip:
     name: AdaptiveCpp HIP gfx942 on a simulated MI300X
     runs-on: ubuntu-24.04
-    timeout-minutes: 330
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -43,14 +50,11 @@ jobs:
       # libraries. find_package(hip) needs the comgr and HSA CMake configs.
       - name: Install dependencies
         run: |
-          df -h / /mnt
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             comgr hsa-rocr rocm-llvm-dev \
             libboost-context-dev libboost-fiber-dev \
             libopenmpi-dev openmpi-bin python3-dev ninja-build ccache
-          df -h / /mnt
-          ls /opt/rocm/lib/llvm/lib/cmake
 
       - uses: hendrikmuhs/ccache-action@dbeefd73e8e2ffc1bbc412570072735eb4db3607 # v1.2.25
         with:
@@ -70,7 +74,6 @@ jobs:
       # which keeps the hip target, and installed where the env script looks.
       - name: Build AdaptiveCpp against ROCm LLVM
         run: |
-          start=$(date +%s)
           git clone --depth 1 -b v25.10.0 https://github.com/AdaptiveCpp/AdaptiveCpp.git build/.env/acpp-git
           cmake -S build/.env/acpp-git -B build/.env/acpp-builddir -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -80,10 +83,8 @@ jobs:
             -DACPP_COMPILER_FEATURE_PROFILE=minimal \
             -DWITH_ROCM_BACKEND=ON -DWITH_CUDA_BACKEND=OFF \
             -DWITH_OPENCL_BACKEND=OFF -DWITH_LEVEL_ZERO_BACKEND=OFF
-          cmake --build build/.env/acpp-builddir -j 3
+          cmake --build build/.env/acpp-builddir -j 4
           cmake --install build/.env/acpp-builddir
-          echo "AdaptiveCpp build took $(( $(date +%s) - start )) s"
-          build/.env/acpp-installdir/bin/acpp-info || true
 
       - name: Set up the environment
         env:
@@ -103,44 +104,25 @@ jobs:
         run: |
           cd build
           source ./activate
-          start=$(date +%s)
-          export NINJA_STATUS="[%f/%t %es] "
           shammake shamrock shamrock_test
-          echo "Shamrock build took $(( $(date +%s) - start )) s"
           ccache -s
-          df -h /
-          free -g
 
-      - name: List devices
+      - name: Select the simulated GPU
         run: |
           cd build
           source ./activate
           ./shamrock --smi | tee smi.txt
           id=$(grep -E '^\| *[0-9]+ *\|.*GPU' smi.txt | head -1 | awk -F'|' '{gsub(/ /,"",$2); print $2}')
-          echo "GPU device id: ${id}"
+          [[ -n "${id}" ]] || { echo "no GPU device listed"; exit 1; }
           echo "SYCLCFG=${id}:${id}" >> "$GITHUB_ENV"
 
       - name: Pull reference files
         run: git clone --depth 1 https://github.com/Shamrock-code/reference-files.git build/reference-files
 
+      # One rank only: the multi-rank runs of test_sequence.sh are left out.
       - name: Unit tests (one MPI rank)
         run: |
           cd build
           source ./activate
-          start=$(date +%s)
           mpirun --allow-run-as-root --bind-to none --oversubscribe -n 1 \
             ./shamrock_test --smi-full --sycl-cfg "${SYCLCFG}" --unittest --loglevel 0
-          echo "Unit tests took $(( $(date +%s) - start )) s"
-
-      # Fork-only check that a wrong device result is caught.
-      - name: Break-the-test check
-        run: |
-          sed -i 's/idx\[i\] = i;/idx[i] = i + (i == 7);/' src/shamalgs/src/primitives/gen_buffer_index.cpp
-          git diff --stat
-          cd build
-          source ./activate
-          shammake shamrock_test
-          if ./shamrock_test --sycl-cfg "${SYCLCFG}" --unittest --loglevel 0 --run-only "shamalgs/primitives/gen_buffer_index"; then
-            echo "mutated kernel was not caught"; exit 1
-          fi
-          echo "mutated kernel caught"
