@@ -52,18 +52,34 @@ jobs:
           df -h / /mnt
           ls /opt/rocm/lib/llvm/lib/cmake
 
-      - name: Set up the environment and build AdaptiveCpp
-        env:
-          LLVM_DIR: /opt/rocm/lib/llvm/lib/cmake/llvm
-          SHAMROCK_BUILD_NPROC: 3
+      # The env script builds AdaptiveCpp with default options, which ROCm's
+      # LLVM does not pass: it reports version 20.0.0 (a development version
+      # to AdaptiveCpp) and has no libLLVM.so for the generic SSCP compiler.
+      # So AdaptiveCpp (the version the env script pins) is built here with
+      # the minimal compiler profile, which keeps the hip target, and
+      # installed where the env script looks for it.
+      - name: Build AdaptiveCpp against ROCm LLVM
         run: |
-          ./env/new-env --machine debian-generic.acpp --builddir build -- --backend hip --arch gfx942
-          cd build
           start=$(date +%s)
-          source ./activate
+          ver=$(sed -n 's/^export ACPP_VERSION=//p' env/machine/debian-generic/acpp/env_built_acpp.sh)
+          git clone --depth 1 -b "$ver" https://github.com/AdaptiveCpp/AdaptiveCpp.git build/.env/acpp-git
+          cmake -S build/.env/acpp-git -B build/.env/acpp-builddir -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/build/.env/acpp-installdir" \
+            -DLLVM_DIR=/opt/rocm/lib/llvm/lib/cmake/llvm \
+            -DACPP_EXPERIMENTAL_LLVM=ON \
+            -DACPP_COMPILER_FEATURE_PROFILE=minimal \
+            -DWITH_ROCM_BACKEND=ON -DWITH_CUDA_BACKEND=OFF \
+            -DWITH_OPENCL_BACKEND=OFF -DWITH_LEVEL_ZERO_BACKEND=OFF
+          cmake --build build/.env/acpp-builddir -j 3
+          cmake --install build/.env/acpp-builddir
           echo "AdaptiveCpp build took $(( $(date +%s) - start )) s"
-          ls .env/acpp-installdir/lib/hipSYCL
-          .env/acpp-installdir/bin/acpp-info || true
+          build/.env/acpp-installdir/bin/acpp-info || true
+
+      - name: Set up the environment
+        env:
+          SHAMROCK_BUILD_NPROC: 3
+        run: ./env/new-env --machine debian-generic.acpp --builddir build -- --backend hip --arch gfx942
 
       - name: Configure
         run: |
